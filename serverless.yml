@@ -1,0 +1,157 @@
+# https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-kinesisfirehose-deliverystream.html
+# https://serverlessland.com/patterns/kinesis-firehose-s3-sam-java
+
+service: kds-kfslambda-test
+
+frameworkVersion: "3"
+
+provider:
+  name: aws
+  region: ${opt:region, 'us-west-1'}
+  stage: ${opt:stage, 'dev'}
+  environment:
+    NODE_ENV: ${opt:stage, 'dev'}
+
+plugins:
+  - serverless-bundle
+  - serverless-iam-roles-per-function
+  - serverless-offline
+
+custom:
+  common:
+    S3_JSON_DESTINATION_BUCKET_NAME: ${self:service}-bucket
+    S3_JSON_DESTINATION_BUCKET_REGION: ${self:provider.region}
+
+functions:
+  transform:
+    handler: src/handler.preprocess
+    runtime: nodejs18.x
+    memorySize: 128
+    timeout: 300
+    logRetentionInDays: 1
+
+resources:
+  Resources:
+    S3BucketForKinesisDestination:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:custom.common.S3_JSON_DESTINATION_BUCKET_NAME}
+
+    DataStream:
+      Type: AWS::Kinesis::Stream
+      Properties:
+        Name: ${self:service}-kinesis
+        RetentionPeriodHours: 24
+        StreamModeDetails:
+          StreamMode: ON_DEMAND
+        # ShardCount: 3
+        Tags:
+          - Key: Environment
+            Value: ${self:provider.stage}
+          - Key: SLS_Service
+            Value: ${self:service}
+
+    DeliveryStreamRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Statement:
+            - Sid: ""
+              Effect: Allow
+              Principal:
+                Service: firehose.amazonaws.com
+              Action: "sts:AssumeRole"
+              Condition:
+                StringEquals:
+                  "sts:ExternalId": !Ref "AWS::AccountId"
+
+    DeliveryStreamPolicy:
+      Type: AWS::IAM::Policy
+      Properties:
+        PolicyName: ${self:service}-firehose_delivery_policy
+        Roles:
+          - !Ref DeliveryStreamRole
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Action:
+                - "s3:AbortMultipartUpload"
+                - "s3:GetBucketLocation"
+                - "s3:GetObject"
+                - "s3:ListBucket"
+                - "s3:ListBucketMultipartUploads"
+                - "s3:PutObject"
+              Resource:
+                - !GetAtt S3BucketForKinesisDestination.Arn
+                - !Join
+                  - ""
+                  - - "arn:aws:s3:::"
+                    - !Ref S3BucketForKinesisDestination
+                    - "*"
+            - Effect: Allow
+              Action:
+                - "kinesis:DescribeStream"
+                - "kinesis:GetShardIterator"
+                - "kinesis:GetRecords"
+                - "kinesis:ListShards"
+              Resource:
+                - !GetAtt DataStream.Arn
+
+    KinesisInvokeLambdaPolicy:
+      Type: AWS::IAM::Policy
+      Properties:
+        PolicyName: ${self:service}-kinesis-invoke-lambda-policy
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Action:
+                - "lambda:InvokeFunction"
+              Resource:
+                - !GetAtt TransformLambdaFunction.Arn
+        Roles:
+          - !Ref DeliveryStreamRole
+
+    KinesisDeliveryStream:
+      Type: AWS::KinesisFirehose::DeliveryStream
+      DependsOn:
+        - DeliveryStreamPolicy
+      Properties:
+        DeliveryStreamName: ${self:service}-kinesis-delivery-stream
+        DeliveryStreamType: KinesisStreamAsSource
+        Tags:
+          - Key: Environment
+            Value: ${self:provider.stage}
+          - Key: SLS_Service
+            Value: ${self:service}
+        KinesisStreamSourceConfiguration:
+          KinesisStreamARN: !GetAtt DataStream.Arn
+          RoleARN: !GetAtt DeliveryStreamRole.Arn
+        ExtendedS3DestinationConfiguration:
+          BucketARN: !GetAtt S3BucketForKinesisDestination.Arn
+          BufferingHints:
+            SizeInMBs: 64 ## must be at least 64 when Dynamic Partitioning is enabled.
+            IntervalInSeconds: 60
+          CompressionFormat: ZIP #UNCOMPRESSED
+          ErrorOutputPrefix: firehose-error/!{firehose:error-output-type}/!{timestamp:yyyy'-'MM'-'dd}/
+          # Prefix: firehose-data/!{timestamp:yyyy'-'MM'-'dd}/
+          Prefix: firehose-data/!{partitionKeyFromQuery:email}/!{timestamp:yyyy'-'MM'-'dd}/ ## if enable DynamicPartitioning 
+          RoleARN: !GetAtt DeliveryStreamRole.Arn
+          DynamicPartitioningConfiguration:
+             Enabled: true
+          ProcessingConfiguration:
+            Enabled:  true
+            Processors:
+              - Type: MetadataExtraction
+                Parameters:
+                  - ParameterName: MetadataExtractionQuery
+                    ParameterValue: '{email : .email}'
+                  - ParameterName: JsonParsingEngine
+                    ParameterValue: JQ-1.6
+              - Type: AppendDelimiterToRecord
+                Parameters:
+                  - ParameterName: Delimiter
+                    ParameterValue: "\\n"
+              - Parameters:
+                  - ParameterName: LambdaArn
+                    ParameterValue: !GetAtt TransformLambdaFunction.Arn
+                Type: Lambda
